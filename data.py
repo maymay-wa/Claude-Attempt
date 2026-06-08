@@ -27,6 +27,7 @@ BASES = "ACGT"
 BASE_TO_IDX = {b: i for i, b in enumerate(BASES)}
 # Reverse-complement base index map: A<->T, C<->G  (A=0,C=1,G=2,T=3)
 COMPLEMENT_IDX = np.array([3, 2, 1, 0], dtype=np.int64)
+_COMPLEMENT_T = torch.from_numpy(COMPLEMENT_IDX)  # reused by reverse_complement_onehot
 
 
 def read_lines(path: str) -> list[str]:
@@ -79,7 +80,7 @@ def reverse_complement_onehot(onehot: torch.Tensor) -> torch.Tensor:
     Reverses the length axis and swaps complementary channels. Binding is
     approximately strand-symmetric, so this is a label-preserving augmentation.
     """
-    comp = torch.from_numpy(COMPLEMENT_IDX).to(onehot.device)
+    comp = _COMPLEMENT_T.to(onehot.device)
     return onehot[:, comp, :].flip(dims=[-1])
 
 
@@ -178,21 +179,20 @@ class TargetTransform:
 
 
 class PairDataset(Dataset):
-    """Yields (dna_onehot[L], protein_idx, target) triples for a set of pairs.
+    """Yields (dna_idx, prot_idx, target) index triples for a set of pairs.
 
-    Pairs are given as parallel arrays of dna indices and protein indices into
-    the full BindingData. DNA one-hot tensors are precomputed and shared; the
-    protein index is resolved to an ESM embedding inside the model/training loop.
+    Only lightweight index arrays are carried here. The DNA one-hot tensor and
+    the ESM embeddings live on the compute device and are gathered by index in
+    the training loop, so each batch ships just a few hundred ints/floats instead
+    of stacking and transferring full one-hot tensors (much faster on MPS/CUDA).
     """
 
     def __init__(
         self,
-        data: BindingData,
         dna_idx: np.ndarray,
         prot_idx: np.ndarray,
         targets: np.ndarray,
     ) -> None:
-        self.dna_onehot = torch.from_numpy(data.dna_onehot)  # [N,4,L]
         self.dna_idx = torch.from_numpy(dna_idx.astype(np.int64))
         self.prot_idx = torch.from_numpy(prot_idx.astype(np.int64))
         self.targets = torch.from_numpy(targets.astype(np.float32))
@@ -201,8 +201,7 @@ class PairDataset(Dataset):
         return len(self.dna_idx)
 
     def __getitem__(self, i: int):
-        d = self.dna_idx[i]
-        return self.dna_onehot[d], self.prot_idx[i], self.targets[i]
+        return self.dna_idx[i], self.prot_idx[i], self.targets[i]
 
 
 def build_long_format(data: BindingData):

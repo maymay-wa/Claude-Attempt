@@ -9,7 +9,15 @@
       "Bash(.venv/bin/python train.py --folds 1 --epochs 2)",
       "Bash(.venv/bin/python evaluate.py)",
       "Bash(.venv/bin/python explore_data.py)",
-      "Bash(.venv/bin/python train.py --folds 1 --epochs 3)"
+      "Bash(.venv/bin/python train.py --folds 1 --epochs 3)",
+      "Bash(python model.py)",
+      "Bash(python -c 'from model import build_model *)",
+      "Bash(python data.py)",
+      "Bash(python -c \"from utils import pick_device, load_config; print\\('device:', pick_device\\(\\)\\)\")",
+      "Bash(time python train.py --folds 1 --epochs 2)",
+      "Bash(python evaluate.py)",
+      "Bash(python -c \"import embed_proteins; print\\('embedders:', list\\(embed_proteins.EMBEDDERS\\)\\)\")",
+      "Bash(python -m py_compile *.py)"
     ]
   }
 }

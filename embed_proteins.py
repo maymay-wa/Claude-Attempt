@@ -27,6 +27,7 @@ import os
 import torch
 
 from data import read_lines
+from utils import pick_device
 
 EMBEDDERS: dict[str, callable] = {}
 
@@ -36,14 +37,6 @@ def register_embedder(name):
         EMBEDDERS[name] = fn
         return fn
     return deco
-
-
-def pick_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 # --- ESM-2 family (frozen, mean-pooled over residues) ----------------------

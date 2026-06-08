@@ -14,6 +14,8 @@ dict {"name": ..., <kwargs>} and constructs the module.
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 
@@ -40,12 +42,22 @@ register_interaction = _register(INTERACTIONS)
 
 
 def _build(reg, spec: dict, **injected):
-    """Instantiate reg[spec['name']] with the remaining spec keys + injected kwargs."""
+    """Instantiate reg[spec['name']] with injected kwargs + the spec keys that the
+    target constructor actually accepts.
+
+    Spec keys the chosen component doesn't take are dropped, so a single config
+    block (e.g. the `interaction` block) can carry the union of options' params
+    and you can swap components by changing `name` alone. The flip side: a typo'd
+    config key is silently ignored rather than raising.
+    """
     spec = dict(spec)
     name = spec.pop("name")
     if name not in reg:
         raise KeyError(f"unknown component {name!r}; available: {sorted(reg)}")
-    return reg[name](**injected, **spec)
+    cls = reg[name]
+    accepted = inspect.signature(cls).parameters
+    kwargs = {k: v for k, v in spec.items() if k in accepted}
+    return cls(**injected, **kwargs)
 
 
 def build_dna_encoder(spec: dict, seq_len: int) -> "BaseDNAEncoder":

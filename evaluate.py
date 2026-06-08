@@ -25,6 +25,7 @@ import torch
 
 from data import load_data, protein_group_folds
 from metrics import per_protein_correlations
+from utils import load_config
 
 
 def model_results(run_dir: str) -> dict:
@@ -111,11 +112,8 @@ def main() -> None:
     ap.add_argument("--knn-k", type=int, default=1)
     args = ap.parse_args()
 
-    import yaml
-
     here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, args.config)) as fh:
-        cfg = yaml.safe_load(fh)
+    cfg = load_config(os.path.join(here, args.config))
 
     data = load_data(
         os.path.join(here, cfg["dbp_path"]),

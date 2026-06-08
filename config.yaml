@@ -37,7 +37,7 @@ interaction:
   dropout: 0.3
 
 # --- training ---
-batch_size: 512
+batch_size: 2048       # large batches amortize MPS kernel-launch overhead; fits easily on M-series/32GB
 epochs: 50
 lr: 0.001
 weight_decay: 0.0001

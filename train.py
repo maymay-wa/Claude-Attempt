@@ -18,7 +18,6 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import yaml
 from torch.utils.data import DataLoader
 
 from data import (
@@ -31,19 +30,7 @@ from data import (
 )
 from metrics import per_protein_correlations
 from model import build_model
-
-
-def pick_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def load_config(path: str) -> dict:
-    with open(path) as fh:
-        return yaml.safe_load(fh)
+from utils import load_config, pick_device
 
 
 def pairs_for_proteins(dna_idx, prot_idx, aff, prot_ids: np.ndarray):
@@ -52,19 +39,21 @@ def pairs_for_proteins(dna_idx, prot_idx, aff, prot_ids: np.ndarray):
     return dna_idx[mask], prot_idx[mask], aff[mask]
 
 
-def run_epoch(model, loader, esm_emb, device, rc_prob, optimizer=None, loss_fn=None):
+def run_epoch(model, loader, dna_onehot, esm_emb, device, rc_prob, optimizer=None, loss_fn=None):
     """One pass over loader. If optimizer is None, runs in eval mode.
 
-    Returns (mean_loss, prot_idx, y_true_std, y_pred_std) where the y arrays are
-    only populated in eval mode (optimizer is None).
+    `dna_onehot` and `esm_emb` are device-resident lookup tables; the loader only
+    supplies indices, so per-batch host->device transfer is just the index/target
+    tensors. Returns (mean_loss, prot_idx, y_true, y_pred); the y arrays are only
+    populated in eval mode (optimizer is None).
     """
     train_mode = optimizer is not None
     model.train(train_mode)
     total, n = 0.0, 0
     all_pidx, all_true, all_pred = [], [], []
 
-    for dna, pidx, target in loader:
-        dna = dna.to(device)
+    for didx, pidx, target in loader:
+        dna = dna_onehot[didx.to(device)]  # gather one-hots on-device
         target = target.to(device)
         if train_mode and rc_prob > 0:
             # reverse-complement augmentation on a random subset of the batch
@@ -100,7 +89,7 @@ def run_epoch(model, loader, esm_emb, device, rc_prob, optimizer=None, loss_fn=N
     )
 
 
-def train_one_fold(fold, train_ids, val_ids, data, esm_emb, cfg, device, out_dir):
+def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir):
     dna_idx, prot_idx, aff = build_long_format(data)
     tr = pairs_for_proteins(dna_idx, prot_idx, aff, train_ids)
     va = pairs_for_proteins(dna_idx, prot_idx, aff, val_ids)
@@ -112,8 +101,8 @@ def train_one_fold(fold, train_ids, val_ids, data, esm_emb, cfg, device, out_dir
     tr_t = tfm.transform(tr[1], tr[2])
     va_t = tfm.transform(va[1], va[2])
 
-    train_ds = PairDataset(data, tr[0], tr[1], tr_t)
-    val_ds = PairDataset(data, va[0], va[1], va_t)
+    train_ds = PairDataset(tr[0], tr[1], tr_t)
+    val_ds = PairDataset(va[0], va[1], va_t)
     pin = device.type == "cuda"
     train_dl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, pin_memory=pin)
     val_dl = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, pin_memory=pin)
@@ -131,8 +120,8 @@ def train_one_fold(fold, train_ids, val_ids, data, esm_emb, cfg, device, out_dir
     bad_epochs = 0
 
     for epoch in range(1, cfg["epochs"] + 1):
-        tr_loss, *_ = run_epoch(model, train_dl, esm_emb, device, cfg["rc_prob"], optimizer, loss_fn)
-        val_loss, vpidx, vtrue, vpred = run_epoch(model, val_dl, esm_emb, device, 0.0, None, loss_fn)
+        tr_loss, *_ = run_epoch(model, train_dl, dna_onehot, esm_emb, device, cfg["rc_prob"], optimizer, loss_fn)
+        val_loss, vpidx, vtrue, vpred = run_epoch(model, val_dl, dna_onehot, esm_emb, device, 0.0, None, loss_fn)
         corr = per_protein_correlations(vpidx, vtrue, vpred)
         pe, sp = corr["pearson_mean"], corr["spearman_mean"]
         scheduler.step(pe)
@@ -191,6 +180,9 @@ def main() -> None:
     ckpt = torch.load(os.path.join(here, cfg["esm_cache"]), map_location="cpu")
     esm_emb = ckpt["embeddings"].to(device)
     embedder = ckpt.get("embedder", ckpt.get("model", "?"))
+    # Both lookup tables are tiny; keep them device-resident so the per-batch
+    # transfer is only the index/target tensors (see run_epoch).
+    dna_onehot = torch.from_numpy(data.dna_onehot).to(device)
     print(f"device={device}  protein_emb={tuple(esm_emb.shape)} ({embedder})  pairs={data.n_dna*data.n_prot:,}")
 
     out_dir = os.path.join(here, "runs")
@@ -203,7 +195,7 @@ def main() -> None:
     fold_means = []
     for fold, (train_ids, val_ids) in enumerate(folds):
         print(f"\n=== Fold {fold}: train {len(train_ids)} proteins, hold out {len(val_ids)} ===")
-        preds = train_one_fold(fold, train_ids, val_ids, data, esm_emb, cfg, device, out_dir)
+        preds = train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir)
         corr = per_protein_correlations(preds["prot_idx"], preds["y_true"], preds["y_pred"])
         fold_means.append((corr["pearson_mean"], corr["spearman_mean"]))
 
