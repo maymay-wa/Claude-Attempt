@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pip install torch numpy scikit-learn scipy fair-esm matplotlib pyyaml)",
+      "Bash(.venv/bin/python -c \"import torch,esm,sklearn,scipy,matplotlib,yaml; print\\('all imports ok; torch',torch.__version__,'mps',torch.backends.mps.is_available\\(\\)\\)\")",
+      "Bash(.venv/bin/python data.py)",
+      "Bash(.venv/bin/python model.py)",
+      "Bash(.venv/bin/python embed_proteins.py --model esm2_t30_150M_UR50D)",
+      "Bash(.venv/bin/python train.py --folds 1 --epochs 2)",
+      "Bash(.venv/bin/python evaluate.py)",
+      "Bash(.venv/bin/python explore_data.py)",
+      "Bash(.venv/bin/python train.py --folds 1 --epochs 3)"
+    ]
+  }
+}
