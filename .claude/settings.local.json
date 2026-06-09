@@ -17,7 +17,18 @@
       "Bash(time python train.py --folds 1 --epochs 2)",
       "Bash(python evaluate.py)",
       "Bash(python -c \"import embed_proteins; print\\('embedders:', list\\(embed_proteins.EMBEDDERS\\)\\)\")",
-      "Bash(python -m py_compile *.py)"
+      "Bash(python -m py_compile *.py)",
+      "Bash(python -c \"import esm; print\\('esm OK', esm.__version__ if hasattr\\(esm,'__version__'\\) else 'ok'\\)\")",
+      "Bash(python -c \"import torch; print\\('mps', torch.backends.mps.is_available\\(\\)\\)\")",
+      "Bash(python embed_proteins.py --embedder esm2_t33_650M_UR50D --batch-size 2)",
+      "Bash(tee /tmp/embed_650m.log)",
+      "Bash(python train.py)",
+      "Bash(tee /tmp/train_650m.log)",
+      "Bash(sed 's#cache/esm2_t33_650M_UR50D.pt#cache/esm2_t30_150M_UR50D.pt#' config.yaml)",
+      "Read(//tmp/**)",
+      "Bash(python train.py --config /tmp/config_150m.yaml)",
+      "Bash(tee /tmp/train_150m.log)",
+      "Bash(echo \"EXIT $?\")"
     ]
   }
 }

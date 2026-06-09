@@ -9,7 +9,7 @@ data_path: training_data_small.txt
 # --- protein encoder (precomputed cache built by embed_proteins.py) ---
 # To swap the protein encoder: build a different cache and point here.
 #   esm2_t30_150M_UR50D.pt (640-d) | esm2_t33_650M_UR50D.pt (1280-d) | kmer3.pt (8000-d baseline)
-esm_cache: cache/esm2_t30_150M_UR50D.pt
+esm_cache: cache/esm2_t33_650M_UR50D.pt
 
 # --- target transform (see explore_data.py for the rationale) ---
 target:
