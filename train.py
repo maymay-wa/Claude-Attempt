@@ -180,6 +180,13 @@ def main() -> None:
     ckpt = torch.load(os.path.join(here, cfg["esm_cache"]), map_location="cpu")
     esm_emb = ckpt["embeddings"].to(device)
     embedder = ckpt.get("embedder", ckpt.get("model", "?"))
+    if esm_emb.shape[0] != data.n_prot:
+        raise ValueError(
+            f"protein-embedding cache {cfg['esm_cache']!r} has {esm_emb.shape[0]} "
+            f"rows but the data has {data.n_prot} proteins. The cache is stale for "
+            f"the current {cfg['dbp_path']!r}; rebuild it with:\n"
+            f"    python embed_proteins.py --embedder {embedder} --dbp {cfg['dbp_path']}"
+        )
     # Both lookup tables are tiny; keep them device-resident so the per-batch
     # transfer is only the index/target tensors (see run_epoch).
     dna_onehot = torch.from_numpy(data.dna_onehot).to(device)

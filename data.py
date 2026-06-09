@@ -1,9 +1,10 @@
 """Data loading and preparation for protein-DNA binding affinity prediction.
 
-Three input files (one record per line, aligned by index):
-  - training_DBPs_small.txt   : 50 protein amino-acid sequences
-  - training_seqs_small.txt   : 5000 DNA probes, 36 bp, alphabet {A,C,G,T}
-  - training_data_small.txt   : 5000 x 50 affinity matrix (space-separated),
+Three input files (one record per line, aligned by index). Counts (P proteins,
+N DNA probes, L bp) are read from the files, not hardcoded:
+  - training_DBPs_small.txt   : P protein amino-acid sequences
+  - training_seqs_small.txt   : N DNA probes, L bp, alphabet {A,C,G,T}
+  - training_data_small.txt   : N x P affinity matrix (space-separated),
                                 row i = DNA probe i, column j = protein j
 
 This module parses the files into a long-format table of
@@ -243,14 +244,15 @@ if __name__ == "__main__":
     )
     print(f"proteins={d.n_prot}  dna={d.n_dna}  affinity={d.affinity.shape}")
     print(f"dna_onehot={d.dna_onehot.shape}  dtype={d.dna_onehot.dtype}")
-    assert d.affinity.shape == (5000, 50), d.affinity.shape
-    assert d.dna_onehot.shape == (5000, 4, 36), d.dna_onehot.shape
-    # one-hot columns should sum to 1 (every base known)
+    n_dna, n_prot = d.affinity.shape
+    seq_len = d.dna_onehot.shape[2]
+    assert d.dna_onehot.shape == (n_dna, 4, seq_len), d.dna_onehot.shape
+    # one-hot columns should sum to at most 1 (unknown bases stay all-zero)
     col_sums = d.dna_onehot.sum(axis=1)
-    assert np.allclose(col_sums, 1.0), "one-hot columns must sum to 1"
+    assert (col_sums <= 1.0 + 1e-6).all(), "one-hot columns must sum to <= 1"
 
     dna_idx, prot_idx, aff = build_long_format(d)
-    assert dna_idx.shape == (5000 * 50,)
+    assert dna_idx.shape == (n_dna * n_prot,)
     # check alignment: long-format value matches matrix
     k = 1234
     assert aff[k] == d.affinity[dna_idx[k], prot_idx[k]]
