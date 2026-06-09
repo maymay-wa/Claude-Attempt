@@ -102,6 +102,51 @@ class CNNEncoder(BaseDNAEncoder):
         return self.project(pooled)
 
 
+@register_dna_encoder("cnn_attn")
+class CNNAttnEncoder(BaseDNAEncoder):
+    """Same conv stack as `cnn`, but the uniform average-pool branch is replaced
+    by a learned multi-head *attentive pool* over sequence positions.
+
+    A 1x1 conv scores every position per head; softmax over the length axis turns
+    those scores into attention weights, and each head returns its weighted sum of
+    conv features. The global max-pool branch is kept identical to `cnn`, so the
+    only thing that changes versus `cnn` is avg-pool -> attentive-pool. That makes
+    the A/B comparison a clean test of whether *learned* position weighting beats
+    uniform averaging -- i.e. whether a full transformer (self-attention across
+    positions) is likely worth the extra engineering.
+
+    pooled = concat[ global_max(h) , head_1, ..., head_H ]  -> Linear -> LayerNorm
+    """
+
+    def __init__(self, seq_len: int, channels: int = 128, out_dim: int = 256,
+                 dropout: float = 0.2, attn_heads: int = 4):
+        super().__init__()
+        self.out_dim = out_dim
+        self.attn_heads = attn_heads
+        self.conv = nn.Sequential(
+            nn.Conv1d(4, channels, kernel_size=8, padding="same"),
+            nn.BatchNorm1d(channels), nn.ReLU(),
+            nn.Conv1d(channels, channels, kernel_size=5, padding="same"),
+            nn.BatchNorm1d(channels), nn.ReLU(), nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=3, padding="same"),
+            nn.BatchNorm1d(channels), nn.ReLU(),
+        )
+        # per-position, per-head attention logits over the length axis
+        self.attn = nn.Conv1d(channels, attn_heads, kernel_size=1)
+        # max branch (1*channels) + attentive branch (attn_heads*channels)
+        self.project = nn.Sequential(
+            nn.Linear((1 + attn_heads) * channels, out_dim), nn.LayerNorm(out_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv(x)                                   # [B, C, L]
+        w = torch.softmax(self.attn(h), dim=-1)            # [B, H, L] (over positions)
+        attn_pooled = torch.bmm(w, h.transpose(1, 2))      # [B, H, C]
+        attn_pooled = attn_pooled.reshape(h.shape[0], -1)  # [B, H*C]
+        pooled = torch.cat([h.amax(dim=-1), attn_pooled], dim=-1)
+        return self.project(pooled)
+
+
 @register_dna_encoder("rnn")
 class BiLSTMEncoder(BaseDNAEncoder):
     """Bidirectional LSTM over the DNA sequence; mean-pools hidden states."""

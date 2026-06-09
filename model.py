@@ -5,7 +5,7 @@
   (prot_emb, dna_emb) --> interaction --> affinity [B]
 
 The three components are chosen by name in config.yaml, so you can swap the DNA
-encoder (cnn/rnn/...), the protein head (mlp/linear/identity), or the fusion
+encoder (cnn/cnn_attn/rnn/...), the protein head (mlp/linear/identity), or the fusion
 (concat_hadamard/concat/bilinear) without changing training code.
 """
 

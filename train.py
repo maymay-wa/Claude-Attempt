@@ -39,13 +39,18 @@ def pairs_for_proteins(dna_idx, prot_idx, aff, prot_ids: np.ndarray):
     return dna_idx[mask], prot_idx[mask], aff[mask]
 
 
-def run_epoch(model, loader, dna_onehot, esm_emb, device, rc_prob, optimizer=None, loss_fn=None):
+def run_epoch(model, loader, dna_onehot, esm_emb, device, rc_prob, optimizer=None,
+              loss_fn=None, tta_rc=False):
     """One pass over loader. If optimizer is None, runs in eval mode.
 
     `dna_onehot` and `esm_emb` are device-resident lookup tables; the loader only
     supplies indices, so per-batch host->device transfer is just the index/target
     tensors. Returns (mean_loss, prot_idx, y_true, y_pred); the y arrays are only
     populated in eval mode (optimizer is None).
+
+    `tta_rc` (eval only): average the prediction over each probe and its
+    reverse-complement. Binding is ~strand-symmetric, so this test-time
+    augmentation is a cheap, label-free accuracy bump.
     """
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -64,6 +69,8 @@ def run_epoch(model, loader, dna_onehot, esm_emb, device, rc_prob, optimizer=Non
 
         with torch.set_grad_enabled(train_mode):
             pred = model(dna, esm_vec)
+            if not train_mode and tta_rc:
+                pred = 0.5 * (pred + model(reverse_complement_onehot(dna), esm_vec))
             loss = loss_fn(pred, target)
         if train_mode:
             optimizer.zero_grad()
@@ -121,7 +128,10 @@ def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, dev
 
     for epoch in range(1, cfg["epochs"] + 1):
         tr_loss, *_ = run_epoch(model, train_dl, dna_onehot, esm_emb, device, cfg["rc_prob"], optimizer, loss_fn)
-        val_loss, vpidx, vtrue, vpred = run_epoch(model, val_dl, dna_onehot, esm_emb, device, 0.0, None, loss_fn)
+        val_loss, vpidx, vtrue, vpred = run_epoch(
+            model, val_dl, dna_onehot, esm_emb, device, 0.0, None, loss_fn,
+            tta_rc=cfg.get("tta_rc", False),
+        )
         corr = per_protein_correlations(vpidx, vtrue, vpred)
         pe, sp = corr["pearson_mean"], corr["spearman_mean"]
         scheduler.step(pe)
@@ -161,6 +171,7 @@ def main() -> None:
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--folds", type=int, default=None, help="limit #folds (smoke test)")
     ap.add_argument("--epochs", type=int, default=None, help="override epochs (smoke test)")
+    ap.add_argument("--out-dir", default="runs", help="dir for checkpoints/preds (per-experiment)")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -192,7 +203,7 @@ def main() -> None:
     dna_onehot = torch.from_numpy(data.dna_onehot).to(device)
     print(f"device={device}  protein_emb={tuple(esm_emb.shape)} ({embedder})  pairs={data.n_dna*data.n_prot:,}")
 
-    out_dir = os.path.join(here, "runs")
+    out_dir = os.path.join(here, args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     folds = list(protein_group_folds(data.n_prot, n_splits=cfg["n_splits"], seed=cfg["seed"]))

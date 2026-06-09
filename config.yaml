@@ -19,10 +19,11 @@ target:
 
 # --- model components (each `name` indexes a registry in encoders.py) ---
 dna_encoder:
-  name: cnn             # cnn | rnn
+  name: cnn       # cnn | cnn_attn | rnn
   channels: 128
   out_dim: 256
   dropout: 0.2
+  attn_heads: 4         # cnn_attn only: # of attentive-pool heads (replaces avg-pool)
 
 protein_encoder:
   name: mlp             # mlp | linear | identity
@@ -42,6 +43,7 @@ epochs: 50
 lr: 0.001
 weight_decay: 0.0001
 rc_prob: 0.5            # probability of reverse-complement augmentation per sample
+tta_rc: false           # eval-time: average prediction over probe + its reverse-complement
 early_stop_patience: 8
 
 # --- cross-validation ---
