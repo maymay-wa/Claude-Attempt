@@ -147,6 +147,56 @@ class CNNAttnEncoder(BaseDNAEncoder):
         return self.project(pooled)
 
 
+@register_dna_encoder("cnn_deep")
+class CNNDeepEncoder(BaseDNAEncoder):
+    """Deeper residual conv stack + multi-head attentive pool + global max pool.
+
+    Strengthens the DNA tower over `cnn`/`cnn_attn`:
+      - 4 conv blocks (kernel 11->7->5->3) with BatchNorm/GELU and inter-block
+        residual connections (cheap to add since all blocks share `channels`).
+      - pooling concatenates global max-pool with an H-head attentive pool, so
+        the protein-independent probe embedding captures both the single strongest
+        motif hit (max) and a learned weighted summary over positions (attention).
+    The DNA side has lots of signal (2000 probes x many proteins), so extra
+    capacity here is low overfitting risk -- unlike the protein side (320 TFs).
+    """
+
+    def __init__(self, seq_len: int, channels: int = 256, out_dim: int = 256,
+                 dropout: float = 0.2, attn_heads: int = 4):
+        super().__init__()
+        self.out_dim = out_dim
+        self.attn_heads = attn_heads
+        self.stem = nn.Sequential(
+            nn.Conv1d(4, channels, kernel_size=11, padding="same"),
+            nn.BatchNorm1d(channels), nn.GELU(),
+        )
+        # residual blocks (same width -> can add input back)
+        self.block1 = self._block(channels, 7, dropout)
+        self.block2 = self._block(channels, 5, dropout)
+        self.block3 = self._block(channels, 3, dropout)
+        self.attn = nn.Conv1d(channels, attn_heads, kernel_size=1)
+        self.project = nn.Sequential(
+            nn.Linear((1 + attn_heads) * channels, out_dim), nn.LayerNorm(out_dim)
+        )
+
+    @staticmethod
+    def _block(channels: int, kernel: int, dropout: float) -> nn.Module:
+        return nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=kernel, padding="same"),
+            nn.BatchNorm1d(channels), nn.GELU(), nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.stem(x)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        h = h + self.block3(h)
+        w = torch.softmax(self.attn(h), dim=-1)            # [B, H, L]
+        attn_pooled = torch.bmm(w, h.transpose(1, 2)).reshape(h.shape[0], -1)
+        pooled = torch.cat([h.amax(dim=-1), attn_pooled], dim=-1)
+        return self.project(pooled)
+
+
 @register_dna_encoder("rnn")
 class BiLSTMEncoder(BaseDNAEncoder):
     """Bidirectional LSTM over the DNA sequence; mean-pools hidden states."""
@@ -186,6 +236,33 @@ class MLPProteinEncoder(BaseProteinEncoder):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+@register_protein_encoder("mlp_res")
+class ResMLPProteinEncoder(BaseProteinEncoder):
+    """Project to `hidden`, then `n_blocks` pre-norm residual MLP blocks, then to
+    `out_dim`. Deeper than `mlp` but residual + dropout keep it trainable on the
+    small (320-protein) train set; this is the swappable protein head."""
+
+    def __init__(self, in_dim: int, out_dim: int = 256, hidden: int = 768,
+                 dropout: float = 0.3, n_blocks: int = 2):
+        super().__init__()
+        self.out_dim = out_dim
+        self.proj = nn.Sequential(nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.GELU())
+        self.blocks = nn.ModuleList(
+            nn.Sequential(
+                nn.LayerNorm(hidden), nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(hidden, hidden),
+            )
+            for _ in range(n_blocks)
+        )
+        self.out = nn.Sequential(nn.Dropout(dropout), nn.Linear(hidden, out_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.proj(x)
+        for blk in self.blocks:
+            h = h + blk(h)
+        return self.out(h)
 
 
 @register_protein_encoder("linear")

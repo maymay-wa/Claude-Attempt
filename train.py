@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 
 import numpy as np
@@ -39,85 +40,151 @@ def pairs_for_proteins(dna_idx, prot_idx, aff, prot_ids: np.ndarray):
     return dna_idx[mask], prot_idx[mask], aff[mask]
 
 
-def run_epoch(model, loader, dna_onehot, esm_emb, device, rc_prob, optimizer=None,
-              loss_fn=None, tta_rc=False):
-    """One pass over loader. If optimizer is None, runs in eval mode.
+def _pair_predict(model, d_emb, p_emb):
+    """Predict the full probe x protein grid from precomputed tower outputs.
 
-    `dna_onehot` and `esm_emb` are device-resident lookup tables; the loader only
-    supplies indices, so per-batch host->device transfer is just the index/target
-    tensors. Returns (mean_loss, prot_idx, y_true, y_pred); the y arrays are only
-    populated in eval mode (optimizer is None).
-
-    `tta_rc` (eval only): average the prediction over each probe and its
-    reverse-complement. Binding is ~strand-symmetric, so this test-time
-    augmentation is a cheap, label-free accuracy bump.
+    d_emb [Bn, Dd] (one row per probe), p_emb [P, Dp] (one row per protein).
+    Expands to the Bn*P pair grid (probe-major: pair i -> probe i//P, protein i%P)
+    and runs the interaction head once. Returns [Bn, P]. The two encoders run once
+    per block here instead of once per pair -- the whole point of two-tower
+    training on a dense matrix.
     """
-    train_mode = optimizer is not None
-    model.train(train_mode)
-    total, n = 0.0, 0
-    all_pidx, all_true, all_pred = [], [], []
+    Bn, P = d_emb.shape[0], p_emb.shape[0]
+    d_rep = d_emb.repeat_interleave(P, dim=0)  # [Bn*P, Dd]
+    p_rep = p_emb.repeat(Bn, 1)                # [Bn*P, Dp]
+    return model.interaction(p_rep, d_rep).view(Bn, P)
 
-    for didx, pidx, target in loader:
-        dna = dna_onehot[didx.to(device)]  # gather one-hots on-device
-        target = target.to(device)
-        if train_mode and rc_prob > 0:
-            # reverse-complement augmentation on a random subset of the batch
+
+def train_epoch_blocked(model, dna_onehot, esm_emb, probe_ids, prot_ids, tmat,
+                        device, rc_prob, block, optimizer, loss_fn):
+    """One training pass in outer-product form.
+
+    Each step samples a block of `block` unique probes, encodes them once with the
+    DNA tower, encodes all `prot_ids` proteins once with the protein tower, then
+    scores the full block x protein grid through the interaction head. `tmat` is the
+    [N, P] per-protein z-scored target matrix (rows = probe id, cols = position in
+    prot_ids).
+    """
+    model.train(True)
+    prot_t = torch.as_tensor(prot_ids, device=device)
+    perm = torch.randperm(len(probe_ids))
+    total, n = 0.0, 0
+    for s in range(0, len(perm), block):
+        pb = perm[s : s + block]  # torch LongTensor of probe ids (probe_ids is arange)
+        dna = dna_onehot[pb.to(device)].clone()
+        if rc_prob > 0:  # per-probe reverse-complement augmentation
             flip = torch.rand(dna.shape[0], device=device) < rc_prob
             if flip.any():
                 dna[flip] = reverse_complement_onehot(dna[flip])
-        esm_vec = esm_emb[pidx.to(device)]
+        tgt = tmat[pb].to(device)  # [Bn, P]
 
-        with torch.set_grad_enabled(train_mode):
-            pred = model(dna, esm_vec)
-            if not train_mode and tta_rc:
-                pred = 0.5 * (pred + model(reverse_complement_onehot(dna), esm_vec))
-            loss = loss_fn(pred, target)
-        if train_mode:
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        else:
-            all_pidx.append(pidx.numpy())
-            all_true.append(target.cpu().numpy())
-            all_pred.append(pred.detach().cpu().numpy())
+        d_emb = model.dna_encoder(dna)
+        p_emb = model.protein_encoder(esm_emb[prot_t])
+        pred = _pair_predict(model, d_emb, p_emb)
+        loss = loss_fn(pred, tgt)
 
-        bs = dna.shape[0]
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        bs = pred.numel()
         total += loss.item() * bs
         n += bs
+    return total / n
 
-    if train_mode:
-        return total / n, None, None, None
-    return (
-        total / n,
-        np.concatenate(all_pidx),
-        np.concatenate(all_true),
-        np.concatenate(all_pred),
-    )
+
+@torch.no_grad()
+def evaluate_blocked(model, dna_onehot, esm_emb, prot_ids, aff_raw, device,
+                     block=4096, tta_rc=False):
+    """Score every probe x protein pair for `prot_ids` and return per-protein
+    correlations against the raw affinity matrix `aff_raw` [N, P_all].
+
+    Encodes all proteins once, then streams probe blocks through the DNA tower.
+    Correlation is invariant to the target transform, so we compare model output
+    directly to raw affinity -- no inverse transform needed.
+    """
+    model.train(False)
+    prot_t = torch.as_tensor(prot_ids, device=device)
+    p_emb = model.protein_encoder(esm_emb[prot_t])  # [P, Dp]
+    N = dna_onehot.shape[0]
+    preds = np.empty((N, len(prot_ids)), dtype=np.float32)
+    for s in range(0, N, block):
+        idx = torch.arange(s, min(s + block, N), device=device)
+        dna = dna_onehot[idx]
+        d_emb = model.dna_encoder(dna)
+        pred = _pair_predict(model, d_emb, p_emb)
+        if tta_rc:
+            d_rc = model.dna_encoder(reverse_complement_onehot(dna))
+            pred = 0.5 * (pred + _pair_predict(model, d_rc, p_emb))
+        preds[s : s + dna.shape[0]] = pred.cpu().numpy()
+
+    # flatten to long form for the metric (and for saving)
+    y_true = aff_raw[:, prot_ids].T.reshape(-1)        # protein-major
+    y_pred = preds.T.reshape(-1)
+    prot_idx = np.repeat(prot_ids, N)
+    dna_idx = np.tile(np.arange(N), len(prot_ids))
+    return prot_idx, dna_idx, y_true, y_pred
+
+
+def build_scheduler(optimizer, cfg):
+    """Returns (scheduler, kind). kind='cosine' steps once per epoch with no args
+    (linear warmup -> cosine decay over cfg['epochs']); kind='plateau' steps on
+    the val metric. Cosine is the default: val Pearson here keeps climbing for
+    many epochs, so a fixed warmup+decay horizon trains longer and more stably
+    than decaying the moment the metric stalls."""
+    kind = cfg.get("scheduler", "cosine")
+    if kind == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+        return sched, "plateau"
+    epochs = cfg["epochs"]
+    warmup = cfg.get("warmup_epochs", 5)
+    min_lr_frac = cfg.get("min_lr_frac", 0.02)  # floor so late epochs still learn
+
+    def lr_lambda(e):  # e is 0-indexed epoch count
+        if e < warmup:
+            return (e + 1) / max(1, warmup)
+        prog = (e - warmup) / max(1, epochs - warmup)
+        return min_lr_frac + (1 - min_lr_frac) * 0.5 * (1 + math.cos(math.pi * min(prog, 1.0)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda), "cosine"
+
+
+def build_target_matrix(tfm: TargetTransform, aff: np.ndarray, prot_ids: np.ndarray) -> torch.Tensor:
+    """[N, len(prot_ids)] per-protein-transformed target matrix (col k = prot_ids[k]).
+
+    Each column is the protein's affinity profile pushed through the fitted
+    TargetTransform (per-protein z-score by default). Held-out proteins absent
+    from the fit fall back to the global train stats -- fine, since the selection
+    metric is correlation (affine-invariant); these targets only feed the loss.
+    """
+    N = aff.shape[0]
+    cols = [tfm.transform(np.full(N, pid), aff[:, pid]) for pid in prot_ids]
+    return torch.from_numpy(np.stack(cols, axis=1).astype(np.float32))
 
 
 def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir):
-    dna_idx, prot_idx, aff = build_long_format(data)
-    tr = pairs_for_proteins(dna_idx, prot_idx, aff, train_ids)
-    va = pairs_for_proteins(dna_idx, prot_idx, aff, val_ids)
+    aff = data.affinity  # [N, P] raw
+    N = data.n_dna
+    train_ids = np.asarray(train_ids)
+    val_ids = np.asarray(val_ids)
 
+    # Fit the target transform on TRAIN pairs only (all probes x train proteins).
     tcfg = cfg["target"]
+    fit_pidx = np.repeat(train_ids, N)
+    fit_vals = aff[:, train_ids].T.reshape(-1)
     tfm = TargetTransform(
         mode=tcfg["mode"], log1p=tcfg["log1p"], clip_quantile=tcfg.get("clip_quantile")
-    ).fit(tr[1], tr[2])
-    tr_t = tfm.transform(tr[1], tr[2])
-    va_t = tfm.transform(va[1], va[2])
+    ).fit(fit_pidx, fit_vals)
+    tmat_train = build_target_matrix(tfm, aff, train_ids)  # [N, n_train]
 
-    train_ds = PairDataset(tr[0], tr[1], tr_t)
-    val_ds = PairDataset(va[0], va[1], va_t)
-    pin = device.type == "cuda"
-    train_dl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True, pin_memory=pin)
-    val_dl = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, pin_memory=pin)
+    probe_ids = np.arange(N)
+    block = cfg.get("probe_block", 512)
 
     seq_len = data.dna_onehot.shape[2]
     model = build_model(cfg, esm_dim=esm_emb.shape[1], seq_len=seq_len).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    scheduler, sched_kind = build_scheduler(optimizer, cfg)
     loss_fn = nn.HuberLoss(delta=1.0)
 
     best_pearson = -np.inf
@@ -127,29 +194,29 @@ def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, dev
     bad_epochs = 0
 
     for epoch in range(1, cfg["epochs"] + 1):
-        tr_loss, *_ = run_epoch(model, train_dl, dna_onehot, esm_emb, device, cfg["rc_prob"], optimizer, loss_fn)
-        val_loss, vpidx, vtrue, vpred = run_epoch(
-            model, val_dl, dna_onehot, esm_emb, device, 0.0, None, loss_fn,
+        tr_loss = train_epoch_blocked(
+            model, dna_onehot, esm_emb, probe_ids, train_ids, tmat_train,
+            device, cfg["rc_prob"], block, optimizer, loss_fn,
+        )
+        vpidx, vdidx, vtrue, vpred = evaluate_blocked(
+            model, dna_onehot, esm_emb, val_ids, aff, device,
             tta_rc=cfg.get("tta_rc", False),
         )
         corr = per_protein_correlations(vpidx, vtrue, vpred)
         pe, sp = corr["pearson_mean"], corr["spearman_mean"]
-        scheduler.step(pe)
+        scheduler.step(pe) if sched_kind == "plateau" else scheduler.step()
         print(
             f"  fold {fold} epoch {epoch:02d}  train_loss={tr_loss:.4f}  "
-            f"val_loss={val_loss:.4f}  val_pearson={pe:.4f}  val_spearman={sp:.4f}"
+            f"val_pearson={pe:.4f}  val_spearman={sp:.4f}"
         )
 
         if pe > best_pearson:
             best_pearson = pe
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            # Store RAW true affinity + model-space prediction. Per-protein metrics
-            # are correlation-based (invariant to the target transform), so no
-            # inverse transform is needed and this stays uniform across modes.
             best_preds = {
                 "prot_idx": vpidx,
-                "dna_idx": va[0],  # aligned: val_ds preserves order (shuffle=False)
-                "y_true": va[2],   # raw affinity
+                "dna_idx": vdidx,
+                "y_true": vtrue,   # raw affinity
                 "y_pred": vpred,   # model output (transformed space)
             }
             bad_epochs = 0

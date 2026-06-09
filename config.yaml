@@ -19,32 +19,40 @@ target:
 
 # --- model components (each `name` indexes a registry in encoders.py) ---
 dna_encoder:
-  name: cnn       # cnn | cnn_attn | rnn
-  channels: 128
+  name: cnn_deep  # cnn | cnn_attn | cnn_deep | rnn
+  channels: 256
   out_dim: 256
   dropout: 0.2
-  attn_heads: 4         # cnn_attn only: # of attentive-pool heads (replaces avg-pool)
+  attn_heads: 4         # cnn_attn/cnn_deep: # of attentive-pool heads
 
 protein_encoder:
-  name: mlp             # mlp | linear | identity
+  name: mlp_res         # mlp | mlp_res | linear | identity
   out_dim: 256
-  hidden: 512
+  hidden: 768
   dropout: 0.3
 
 interaction:
   name: concat_hadamard # concat_hadamard | concat | bilinear
   emb_dim: 256
-  hidden: 256
+  hidden: 384
   dropout: 0.3
 
 # --- training ---
-batch_size: 2048       # large batches amortize MPS kernel-launch overhead; fits easily on M-series/32GB
-epochs: 50
-lr: 0.001
+# Two-tower outer-product training: each step encodes `probe_block` unique probes
+# once and ALL train proteins once, then scores the full grid through the cheap
+# interaction head (no redundant convolutions). One step covers probe_block x
+# n_train_proteins pairs. batch_size is unused by the blocked trainer.
+probe_block: 512
+batch_size: 2048       # (legacy; unused by blocked trainer)
+epochs: 100
+lr: 0.0015
 weight_decay: 0.0001
-rc_prob: 0.5            # probability of reverse-complement augmentation per sample
-tta_rc: false           # eval-time: average prediction over probe + its reverse-complement
-early_stop_patience: 8
+scheduler: cosine      # cosine (linear warmup -> cosine decay) | plateau
+warmup_epochs: 5
+min_lr_frac: 0.02      # cosine LR floor as a fraction of peak lr
+rc_prob: 0.5           # probability of reverse-complement augmentation per sample
+tta_rc: true           # eval-time: average prediction over probe + its reverse-complement
+early_stop_patience: 20
 
 # --- cross-validation ---
 n_splits: 5            # leave-proteins-out GroupKFold (50 proteins -> 10 held out/fold)

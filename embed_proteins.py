@@ -47,9 +47,25 @@ _ESM_LOADERS = {
 }
 
 
+def _pool_residues(reps_seq: torch.Tensor, pool: str) -> torch.Tensor:
+    """Pool per-residue reps [L, D] -> fixed vector. `meanmax`/`meanmaxstd`
+    concatenate complementary statistics: mean (overall composition), max (the
+    strongest residue signal, where DNA-binding-domain motifs tend to show up),
+    and std (residue-level variability). Richer than mean alone for capturing
+    which residues drive specificity."""
+    if pool == "mean":
+        return reps_seq.mean(dim=0)
+    if pool == "meanmax":
+        return torch.cat([reps_seq.mean(dim=0), reps_seq.amax(dim=0)])
+    if pool == "meanmaxstd":
+        return torch.cat([reps_seq.mean(dim=0), reps_seq.amax(dim=0), reps_seq.std(dim=0)])
+    raise ValueError(f"unknown pool {pool!r}")
+
+
 def _make_esm_embedder(model_name: str, repr_layer: int):
     @torch.no_grad()
-    def _embed(proteins: list[str], device: torch.device, batch_size: int = 4) -> torch.Tensor:
+    def _embed(proteins: list[str], device: torch.device, batch_size: int = 4,
+               pool: str = "mean") -> torch.Tensor:
         import esm
 
         loader = getattr(esm.pretrained, model_name)
@@ -64,7 +80,7 @@ def _make_esm_embedder(model_name: str, repr_layer: int):
             out = model(tokens.to(device), repr_layers=[repr_layer], return_contacts=False)
             reps = out["representations"][repr_layer]
             for k, seq in enumerate(chunk):
-                embs.append(reps[k, 1 : len(seq) + 1].mean(dim=0).float().cpu())
+                embs.append(_pool_residues(reps[k, 1 : len(seq) + 1].float(), pool).cpu())
             print(f"  embedded {min(start + batch_size, len(proteins))}/{len(proteins)}")
         return torch.stack(embs, dim=0)
 
