@@ -1,0 +1,28 @@
+device=mps  embedder=esm2_t33_650M_UR50D  n_proteins=400
+  DBD extraction: 180 homeodomain-anchored, 220 K/R-window; mean 60 residues (vs 144 full)
+  embedded 16/400
+  embedded 32/400
+  embedded 48/400
+  embedded 64/400
+  embedded 80/400
+  embedded 96/400
+  embedded 112/400
+  embedded 128/400
+  embedded 144/400
+  embedded 160/400
+  embedded 176/400
+  embedded 192/400
+  embedded 208/400
+  embedded 224/400
+  embedded 240/400
+  embedded 256/400
+  embedded 272/400
+  embedded 288/400
+  embedded 304/400
+  embedded 320/400
+  embedded 336/400
+  embedded 352/400
+  embedded 368/400
+  embedded 384/400
+  embedded 400/400
+saved domain embeddings (400, 60, 1280) (lengths 60..60) -> /Users/mayerunterberg/Library/Mobile Documents/com~apple~CloudDocs/Documents/Semester 2/Deep Learning for Bio/Claude Attempt/cache/esm2_t33_650M_UR50D_homeodomain_perres.pt

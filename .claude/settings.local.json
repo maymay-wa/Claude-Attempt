@@ -48,7 +48,10 @@
       "Bash(tee embed_650M_perres.log)",
       "Bash(python -c ' *)",
       "Bash(python train.py --folds 1 --epochs 2 --out-dir runs/crossattn_smoke)",
-      "Bash(tee runs_crossattn_smoke.log)"
+      "Bash(tee runs_crossattn_smoke.log)",
+      "Bash(./.venv/bin/python -c ' *)",
+      "Bash(./.venv/bin/python model.py)",
+      "Bash(./.venv/bin/python data.py)"
     ]
   }
 }

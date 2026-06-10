@@ -1,0 +1,68 @@
+# Homeodomain / DBD-trimmed variant of the two-tower binding model.
+#
+# Identical architecture and hyperparameters to config.yaml; the ONLY change is
+# `esm_cache`, which points at ESM-2 embeddings of the trimmed ~60-residue
+# DNA-binding domain (built by embed_domains.py) instead of the full protein.
+# Running this config vs config.yaml is therefore a clean A/B test of the
+# brief's central claim: "domain extraction beats full sequence."
+
+# --- data files ---
+dbp_path: training_DBPs_small.txt
+seq_path: training_seqs_small.txt
+data_path: training_data_small.txt
+
+# --- protein encoder: per-residue ESM of the TRIMMED DBD (~60 aa, not full) ---
+esm_cache: cache/esm2_t33_650M_UR50D_homeodomain_perres.pt
+
+# --- target transform (per-protein z-score; specificity, not absolute scale) ---
+target:
+  mode: per_protein
+  log1p: false
+  clip_quantile: 0.001
+
+# --- model components (see encoders.py registries) ---
+# Cross-attention motif-match stack: DNA keeps a per-position map, the protein
+# becomes K specificity tokens, the head scans tokens over DNA positions.
+dna_encoder:
+  name: cnn_deep_pos
+  channels: 256
+  out_dim: 128
+  dropout: 0.2
+
+protein_encoder:
+  name: attn_pool_tokens   # K learned queries pool the recognition-helix residues
+  out_dim: 128
+  n_tokens: 8
+  hidden: 512
+  attn_dim: 128
+  dropout: 0.3
+
+interaction:
+  name: cross_attn         # DNA positions <-> protein specificity tokens
+  attn_dim: 64
+  tok_embed: 32
+  hidden: 128
+  dropout: 0.3
+
+# --- training ---
+probe_block: 256
+batch_size: 2048           # (legacy; unused by the blocked trainer)
+epochs: 100
+lr: 0.0015
+weight_decay: 0.0001
+
+# --- loss: elementwise Huber + per-protein correlation term (metric-aligned) ---
+loss:
+  huber_delta: 1.0
+  corr_lambda: 1.0
+esm_noise: 0.05
+scheduler: cosine
+warmup_epochs: 5
+min_lr_frac: 0.02
+rc_prob: 0.5               # reverse-complement augmentation
+tta_rc: true              # eval-time reverse-complement averaging
+early_stop_patience: 20
+
+# --- cross-validation ---
+n_splits: 5
+seed: 0

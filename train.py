@@ -274,12 +274,20 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=None, help="limit #folds (smoke test)")
     ap.add_argument("--epochs", type=int, default=None, help="override epochs (smoke test)")
     ap.add_argument("--out-dir", default="runs", help="dir for checkpoints/preds (per-experiment)")
+    ap.add_argument("--esm-cache", default=None, help="override cfg['esm_cache'] (A/B different protein towers)")
+    ap.add_argument("--seed", type=int, default=None, help="override cfg['seed'] (seed-ensembling)")
+    ap.add_argument("--probe-subsample", type=int, default=None,
+                    help="train/eval on a random subset of N probes (fast, fair A/B smoke)")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
     cfg = load_config(os.path.join(here, args.config))
     if args.epochs is not None:
         cfg["epochs"] = args.epochs
+    if args.esm_cache is not None:
+        cfg["esm_cache"] = args.esm_cache
+    if args.seed is not None:
+        cfg["seed"] = args.seed
 
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
@@ -290,6 +298,15 @@ def main() -> None:
         os.path.join(here, cfg["seq_path"]),
         os.path.join(here, cfg["data_path"]),
     )
+    if args.probe_subsample is not None and args.probe_subsample < data.n_dna:
+        # Deterministic probe subset (seeded) so an A/B over esm_cache sees the
+        # exact same probes -- only the protein tower's input changes.
+        rng = np.random.default_rng(cfg["seed"])
+        keep = np.sort(rng.choice(data.n_dna, args.probe_subsample, replace=False))
+        data.dna_seqs = [data.dna_seqs[i] for i in keep]
+        data.affinity = data.affinity[keep]
+        data.dna_onehot = data.dna_onehot[keep]
+        print(f"probe subsample: {len(keep)}/{args.probe_subsample} probes (seed {cfg['seed']})")
     ckpt = torch.load(os.path.join(here, cfg["esm_cache"]), map_location="cpu")
     embedder = ckpt.get("embedder", ckpt.get("model", "?"))
     per_residue = ckpt.get("per_residue", False)
