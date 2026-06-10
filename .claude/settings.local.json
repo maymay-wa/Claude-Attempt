@@ -28,7 +28,27 @@
       "Read(//tmp/**)",
       "Bash(python train.py --config /tmp/config_150m.yaml)",
       "Bash(tee /tmp/train_150m.log)",
-      "Bash(echo \"EXIT $?\")"
+      "Bash(echo \"EXIT $?\")",
+      "Bash(python -c \"import torch, scipy, sklearn, numpy, yaml; print\\('torch', torch.__version__, 'mps', torch.backends.mps.is_available\\(\\)\\)\")",
+      "Bash(python -c \"import esm; print\\('esm OK', esm.__file__\\)\")",
+      "Read(//Users/mayerunterberg/.cache/torch/hub/checkpoints/**)",
+      "Bash(ls -la runs/)",
+      "Bash(ls -la *.txt)",
+      "Bash(find \"/Users/mayerunterberg/Library/Mobile Documents/com~apple~CloudDocs/Documents/Semester 2/Deep Learning for Bio\" -maxdepth 3 -iname \"*training_data*\")",
+      "Bash(find \"/Users/mayerunterberg/Library/Mobile Documents/com~apple~CloudDocs/Documents/Semester 2/Deep Learning for Bio\" -maxdepth 3 -name \"*.txt\" -size +1M)",
+      "Bash(cat .gitignore)",
+      "Read(//Users/mayerunterberg/Library/Mobile Documents/com~apple~CloudDocs/Documents/Semester 2/Deep Learning for Bio/**)",
+      "Bash(awk '{print NF}')",
+      "Bash(md5 -q \"Claude Attempt/training_seqs_small.txt\" \"Bio Project/Data/training_seqs_small.txt\")",
+      "Bash(md5 -q \"Claude Attempt/training_DBPs_small.txt\" \"Bio Project/Data/training_DBPs_small.txt\")",
+      "Bash(ln -sf \"../Bio Project/Data/training_data_small.txt\" training_data_small.txt)",
+      "Bash(python -c \"import numpy as np; a=np.loadtxt\\('training_data_small.txt',dtype=np.float32,max_rows=5\\); print\\('first 5 rows shape:', a.shape\\)\")",
+      "Bash(python analyze_preds.py runs/preds_fold0.npz)",
+      "Bash(python embed_proteins.py --embedder esm2_t33_650M_UR50D --per-residue)",
+      "Bash(tee embed_650M_perres.log)",
+      "Bash(python -c ' *)",
+      "Bash(python train.py --folds 1 --epochs 2 --out-dir runs/crossattn_smoke)",
+      "Bash(tee runs_crossattn_smoke.log)"
     ]
   }
 }

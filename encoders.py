@@ -197,6 +197,37 @@ class CNNDeepEncoder(BaseDNAEncoder):
         return self.project(pooled)
 
 
+@register_dna_encoder("cnn_deep_pos")
+class CNNDeepPosEncoder(BaseDNAEncoder):
+    """Same residual conv trunk as `cnn_deep`, but returns the *per-position*
+    feature map `[B, L, out_dim]` instead of a pooled vector. The cross-attention
+    interaction head needs every position (candidate motif site) as keys/values,
+    so we keep the length axis and only project channels -> out_dim per position.
+    """
+
+    def __init__(self, seq_len: int, channels: int = 256, out_dim: int = 128,
+                 dropout: float = 0.2):
+        super().__init__()
+        self.out_dim = out_dim
+        self.stem = nn.Sequential(
+            nn.Conv1d(4, channels, kernel_size=11, padding="same"),
+            nn.BatchNorm1d(channels), nn.GELU(),
+        )
+        self.block1 = CNNDeepEncoder._block(channels, 7, dropout)
+        self.block2 = CNNDeepEncoder._block(channels, 5, dropout)
+        self.block3 = CNNDeepEncoder._block(channels, 3, dropout)
+        self.proj = nn.Conv1d(channels, out_dim, kernel_size=1)  # per-position
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.stem(x)
+        h = h + self.block1(h)
+        h = h + self.block2(h)
+        h = h + self.block3(h)
+        h = self.proj(h).transpose(1, 2)   # [B, L, out_dim]
+        return self.norm(h)
+
+
 @register_dna_encoder("rnn")
 class BiLSTMEncoder(BaseDNAEncoder):
     """Bidirectional LSTM over the DNA sequence; mean-pools hidden states."""
@@ -265,6 +296,45 @@ class ResMLPProteinEncoder(BaseProteinEncoder):
         return self.out(h)
 
 
+@register_protein_encoder("attn_pool_tokens")
+class AttnPoolTokensEncoder(BaseProteinEncoder):
+    """Per-residue ESM reps [B, R, in_dim] (+ valid mask [B, R]) -> K "specificity"
+    query tokens [B, K, out_dim] via learned multi-query attention pooling.
+
+    Instead of mean-pooling the whole protein (which dilutes the DNA-binding
+    domain), K learnable queries each attend over the residues and pull out a
+    distinct pooled summary. Those K tokens are what the cross-attention head
+    later scans the DNA with -- i.e. a small, learned, per-TF set of motif probes.
+    Masking ignores padded residues, so variable-length proteins share one tensor.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int = 128, n_tokens: int = 8,
+                 hidden: int = 512, attn_dim: int = 128, dropout: float = 0.3):
+        super().__init__()
+        self.out_dim = out_dim
+        self.n_tokens = n_tokens
+        self.attn_dim = attn_dim
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(dropout),
+        )
+        self.key = nn.Linear(hidden, attn_dim)
+        self.val = nn.Linear(hidden, out_dim)
+        self.queries = nn.Parameter(torch.randn(n_tokens, attn_dim) * (attn_dim ** -0.5))
+        self.out_norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: [B, R, in_dim]; mask: [B, R] bool (True = real residue)
+        h = self.proj(x)                                  # [B, R, hidden]
+        k = self.key(h)                                   # [B, R, attn_dim]
+        v = self.val(h)                                   # [B, R, out_dim]
+        logits = torch.einsum("ka,bra->bkr", self.queries, k) * (self.attn_dim ** -0.5)
+        if mask is not None:
+            logits = logits.masked_fill(~mask.unsqueeze(1), float("-inf"))  # [B,K,R]
+        attn = torch.softmax(logits, dim=-1)
+        tokens = torch.einsum("bkr,brv->bkv", attn, v)    # [B, K, out_dim]
+        return self.out_norm(tokens)
+
+
 @register_protein_encoder("linear")
 class LinearProteinEncoder(BaseProteinEncoder):
     def __init__(self, in_dim: int, out_dim: int = 256):
@@ -309,6 +379,67 @@ class ConcatHadamardHead(nn.Module):
     def forward(self, p: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
         p, d = self.p_proj(p), self.d_proj(d)
         return self.head(torch.cat([p, d, p * d], dim=-1)).squeeze(-1)
+
+
+@register_interaction("cross_attn")
+class CrossAttnHead(nn.Module):
+    """Motif-match cross-attention: a TF's K query tokens scan the DNA positions.
+
+    Protein tokens p [.., K, Dp] and DNA per-position features d [.., L, Dd] are
+    projected to a shared `attn_dim`; the match score of token k at position l is
+    their scaled dot product. Per token we summarise the scan over positions by
+    [max, mean, std] -- max captures "this motif occurs *somewhere* in the probe",
+    mean/std its overall presence/sharpness. A small per-token MLP embeds those
+    stats; we pool over tokens (mean+max, so the head is agnostic to K) and read
+    out a scalar affinity. This models binding as a learned, per-TF motif scan
+    rather than a dot product of two globally pooled vectors.
+
+    `score_grid` computes the full probe x protein grid in one batched einsum
+    (the trainer's outer-product step), avoiding any [Bn*P, ...] materialisation.
+    """
+
+    def __init__(self, prot_dim: int, dna_dim: int, attn_dim: int = 64,
+                 tok_embed: int = 32, hidden: int = 128, dropout: float = 0.3):
+        super().__init__()
+        self.scale = attn_dim ** -0.5
+        self.p_proj = nn.Linear(prot_dim, attn_dim)
+        self.d_proj = nn.Linear(dna_dim, attn_dim)
+        self.tok_mlp = nn.Sequential(
+            nn.Linear(3, tok_embed), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(tok_embed, tok_embed),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(2 * tok_embed), nn.Linear(2 * tok_embed, hidden), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(hidden, 1),
+        )
+
+    @staticmethod
+    def _pos_stats(s: torch.Tensor) -> torch.Tensor:
+        """Summarise scan scores over the position axis (last dim) -> [..., 3]."""
+        return torch.stack([s.amax(-1), s.mean(-1), s.std(-1)], dim=-1)
+
+    def _readout(self, stats: torch.Tensor) -> torch.Tensor:
+        """stats [..., K, 3] -> scalar [...]. Pool over tokens with mean+max."""
+        e = self.tok_mlp(stats)                                   # [..., K, tok_embed]
+        agg = torch.cat([e.mean(dim=-2), e.amax(dim=-2)], dim=-1)  # [..., 2*tok_embed]
+        return self.head(agg).squeeze(-1)
+
+    def score_grid(self, p: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """p [P, K, Dp], d [Bn, L, Dd] -> affinity grid [Bn, P]."""
+        pa = self.p_proj(p)                       # [P, K, A]
+        da = self.d_proj(d)                       # [Bn, L, A]
+        s = torch.einsum("pka,bla->bpkl", pa, da) * self.scale   # [Bn, P, K, L]
+        return self._readout(self._pos_stats(s))                 # [Bn, P]
+
+    def forward(self, p: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        # Paired path (also lets the generic model.py smoke test feed 2-D inputs).
+        if p.dim() == 2:
+            p = p.unsqueeze(1)   # [N, 1, Dp]
+        if d.dim() == 2:
+            d = d.unsqueeze(1)   # [N, 1, Dd]
+        pa, da = self.p_proj(p), self.d_proj(d)                  # [N,K,A],[N,L,A]
+        s = torch.einsum("nka,nla->nkl", pa, da) * self.scale     # [N, K, L]
+        return self._readout(self._pos_stats(s))                  # [N]
 
 
 @register_interaction("concat")

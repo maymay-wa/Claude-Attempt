@@ -43,27 +43,55 @@ def pairs_for_proteins(dna_idx, prot_idx, aff, prot_ids: np.ndarray):
 def _pair_predict(model, d_emb, p_emb):
     """Predict the full probe x protein grid from precomputed tower outputs.
 
-    d_emb [Bn, Dd] (one row per probe), p_emb [P, Dp] (one row per protein).
-    Expands to the Bn*P pair grid (probe-major: pair i -> probe i//P, protein i%P)
-    and runs the interaction head once. Returns [Bn, P]. The two encoders run once
-    per block here instead of once per pair -- the whole point of two-tower
-    training on a dense matrix.
+    d_emb (one row/block per probe), p_emb (one row/token-set per protein).
+    Interaction heads that expose `score_grid` (e.g. cross_attn) compute the grid
+    directly in a batched einsum -- no [Bn*P, ...] materialisation. Otherwise we
+    fall back to expanding to the Bn*P pair grid (probe-major: pair i -> probe
+    i//P, protein i%P) and running the interaction head once. Returns [Bn, P].
     """
+    inter = model.interaction
+    if hasattr(inter, "score_grid"):
+        return inter.score_grid(p_emb, d_emb)  # p [P,K,Dp], d [Bn,L,Dd] -> [Bn,P]
     Bn, P = d_emb.shape[0], p_emb.shape[0]
     d_rep = d_emb.repeat_interleave(P, dim=0)  # [Bn*P, Dd]
     p_rep = p_emb.repeat(Bn, 1)                # [Bn*P, Dp]
-    return model.interaction(p_rep, d_rep).view(Bn, P)
+    return inter(p_rep, d_rep).view(Bn, P)
+
+
+def _encode_proteins(model, esm_emb, esm_mask, prot_t, noise: float = 0.0):
+    """Run the protein tower on the given protein ids. Passes a residue mask when
+    the cache is per-residue ([P, R, D]); optionally adds Gaussian noise to the
+    (frozen) features as a regulariser against protein-tower overfitting (320 TFs)."""
+    x = esm_emb[prot_t]
+    if noise > 0:
+        x = x + noise * torch.randn_like(x)
+    if esm_mask is not None:
+        return model.protein_encoder(x, esm_mask[prot_t])
+    return model.protein_encoder(x)
+
+
+def pearson_corr_loss(pred: torch.Tensor, tgt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """1 - mean per-protein Pearson r, correlating over the probe block (rows) for
+    each protein (column). A stochastic estimate of the eval metric, so optimising
+    it directly aligns training with leave-proteins-out per-protein correlation."""
+    p = pred - pred.mean(dim=0, keepdim=True)
+    t = tgt - tgt.mean(dim=0, keepdim=True)
+    num = (p * t).sum(dim=0)
+    den = torch.sqrt((p * p).sum(dim=0) * (t * t).sum(dim=0) + eps)
+    return 1.0 - (num / (den + eps)).mean()
 
 
 def train_epoch_blocked(model, dna_onehot, esm_emb, probe_ids, prot_ids, tmat,
-                        device, rc_prob, block, optimizer, loss_fn):
+                        device, rc_prob, block, optimizer, loss_fn,
+                        esm_mask=None, esm_noise=0.0, corr_lambda=0.0):
     """One training pass in outer-product form.
 
     Each step samples a block of `block` unique probes, encodes them once with the
     DNA tower, encodes all `prot_ids` proteins once with the protein tower, then
     scores the full block x protein grid through the interaction head. `tmat` is the
     [N, P] per-protein z-scored target matrix (rows = probe id, cols = position in
-    prot_ids).
+    prot_ids). The loss blends the elementwise `loss_fn` (Huber) with a per-protein
+    correlation term weighted by `corr_lambda` (aligned to the eval metric).
     """
     model.train(True)
     prot_t = torch.as_tensor(prot_ids, device=device)
@@ -79,9 +107,11 @@ def train_epoch_blocked(model, dna_onehot, esm_emb, probe_ids, prot_ids, tmat,
         tgt = tmat[pb].to(device)  # [Bn, P]
 
         d_emb = model.dna_encoder(dna)
-        p_emb = model.protein_encoder(esm_emb[prot_t])
+        p_emb = _encode_proteins(model, esm_emb, esm_mask, prot_t, noise=esm_noise)
         pred = _pair_predict(model, d_emb, p_emb)
         loss = loss_fn(pred, tgt)
+        if corr_lambda > 0:
+            loss = loss + corr_lambda * pearson_corr_loss(pred, tgt)
 
         optimizer.zero_grad()
         loss.backward()
@@ -96,7 +126,7 @@ def train_epoch_blocked(model, dna_onehot, esm_emb, probe_ids, prot_ids, tmat,
 
 @torch.no_grad()
 def evaluate_blocked(model, dna_onehot, esm_emb, prot_ids, aff_raw, device,
-                     block=4096, tta_rc=False):
+                     block=4096, tta_rc=False, esm_mask=None):
     """Score every probe x protein pair for `prot_ids` and return per-protein
     correlations against the raw affinity matrix `aff_raw` [N, P_all].
 
@@ -106,7 +136,7 @@ def evaluate_blocked(model, dna_onehot, esm_emb, prot_ids, aff_raw, device,
     """
     model.train(False)
     prot_t = torch.as_tensor(prot_ids, device=device)
-    p_emb = model.protein_encoder(esm_emb[prot_t])  # [P, Dp]
+    p_emb = _encode_proteins(model, esm_emb, esm_mask, prot_t)  # [P, Dp] or [P, K, Dp]
     N = dna_onehot.shape[0]
     preds = np.empty((N, len(prot_ids)), dtype=np.float32)
     for s in range(0, N, block):
@@ -163,7 +193,8 @@ def build_target_matrix(tfm: TargetTransform, aff: np.ndarray, prot_ids: np.ndar
     return torch.from_numpy(np.stack(cols, axis=1).astype(np.float32))
 
 
-def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir):
+def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir,
+                   esm_mask=None):
     aff = data.affinity  # [N, P] raw
     N = data.n_dna
     train_ids = np.asarray(train_ids)
@@ -182,10 +213,13 @@ def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, dev
     block = cfg.get("probe_block", 512)
 
     seq_len = data.dna_onehot.shape[2]
-    model = build_model(cfg, esm_dim=esm_emb.shape[1], seq_len=seq_len).to(device)
+    model = build_model(cfg, esm_dim=esm_emb.shape[-1], seq_len=seq_len).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     scheduler, sched_kind = build_scheduler(optimizer, cfg)
-    loss_fn = nn.HuberLoss(delta=1.0)
+    lcfg = cfg.get("loss", {})
+    loss_fn = nn.HuberLoss(delta=lcfg.get("huber_delta", 1.0))
+    corr_lambda = lcfg.get("corr_lambda", 0.0)
+    esm_noise = cfg.get("esm_noise", 0.0)
 
     best_pearson = -np.inf
     best_state = None
@@ -197,10 +231,11 @@ def train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, dev
         tr_loss = train_epoch_blocked(
             model, dna_onehot, esm_emb, probe_ids, train_ids, tmat_train,
             device, cfg["rc_prob"], block, optimizer, loss_fn,
+            esm_mask=esm_mask, esm_noise=esm_noise, corr_lambda=corr_lambda,
         )
         vpidx, vdidx, vtrue, vpred = evaluate_blocked(
             model, dna_onehot, esm_emb, val_ids, aff, device,
-            tta_rc=cfg.get("tta_rc", False),
+            tta_rc=cfg.get("tta_rc", False), esm_mask=esm_mask,
         )
         corr = per_protein_correlations(vpidx, vtrue, vpred)
         pe, sp = corr["pearson_mean"], corr["spearman_mean"]
@@ -256,8 +291,14 @@ def main() -> None:
         os.path.join(here, cfg["data_path"]),
     )
     ckpt = torch.load(os.path.join(here, cfg["esm_cache"]), map_location="cpu")
-    esm_emb = ckpt["embeddings"].to(device)
     embedder = ckpt.get("embedder", ckpt.get("model", "?"))
+    per_residue = ckpt.get("per_residue", False)
+    esm_emb = ckpt["embeddings"].float().to(device)  # [P, D] or [P, R, D]
+    esm_mask = None
+    if per_residue:  # build [P, R] validity mask from true lengths (ignore padding)
+        R = esm_emb.shape[1]
+        ar = torch.arange(R, device=device)
+        esm_mask = ar[None, :] < ckpt["lengths"].to(device)[:, None]  # [P, R] bool
     if esm_emb.shape[0] != data.n_prot:
         raise ValueError(
             f"protein-embedding cache {cfg['esm_cache']!r} has {esm_emb.shape[0]} "
@@ -265,10 +306,11 @@ def main() -> None:
             f"the current {cfg['dbp_path']!r}; rebuild it with:\n"
             f"    python embed_proteins.py --embedder {embedder} --dbp {cfg['dbp_path']}"
         )
-    # Both lookup tables are tiny; keep them device-resident so the per-batch
-    # transfer is only the index/target tensors (see run_epoch).
+    # Both lookup tables are device-resident so the per-step cost is the towers,
+    # not host->device transfer (per-residue reps are ~1.7 GB for 650M).
     dna_onehot = torch.from_numpy(data.dna_onehot).to(device)
-    print(f"device={device}  protein_emb={tuple(esm_emb.shape)} ({embedder})  pairs={data.n_dna*data.n_prot:,}")
+    print(f"device={device}  protein_emb={tuple(esm_emb.shape)} ({embedder}"
+          f"{', per-residue' if per_residue else ''})  pairs={data.n_dna*data.n_prot:,}")
 
     out_dir = os.path.join(here, args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
@@ -280,7 +322,8 @@ def main() -> None:
     fold_means = []
     for fold, (train_ids, val_ids) in enumerate(folds):
         print(f"\n=== Fold {fold}: train {len(train_ids)} proteins, hold out {len(val_ids)} ===")
-        preds = train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir)
+        preds = train_one_fold(fold, train_ids, val_ids, data, dna_onehot, esm_emb, cfg, device, out_dir,
+                               esm_mask=esm_mask)
         corr = per_protein_correlations(preds["prot_idx"], preds["y_true"], preds["y_pred"])
         fold_means.append((corr["pearson_mean"], corr["spearman_mean"]))
 
