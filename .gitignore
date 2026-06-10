@@ -2,4 +2,4 @@
 __pycache__*
 cache*
 runs*
-training_data_small*
+training_data_small*training_data_small.txt
