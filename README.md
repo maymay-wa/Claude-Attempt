@@ -24,6 +24,7 @@ beating a *k*-nearest-neighbour-in-ESM baseline.
 - [Domain extraction](#domain-extraction)
 - [Training internals](#training-internals)
 - [Evaluation & baselines](#evaluation--baselines)
+- [Prediction & submission](#prediction--submission)
 - [Files](#files)
 - [Reading the results](#reading-the-results)
 
@@ -58,7 +59,9 @@ python data.py                         # parsing, folds, reverse-complement, tar
 python homeodomain.py                  # DBD-extraction coverage + self-validation
 
 # 1. cache frozen protein embeddings (run once each; heavy)
-python embed_proteins.py --embedder esm2_t33_650M_UR50D --per-residue   # full protein
+python embed_proteins.py --embedder esm2_t33_650M_UR50D --per-residue   # full protein (train)
+python embed_proteins.py --embedder esm2_t33_650M_UR50D --per-residue \
+    --dbp test_DBPs.txt --out cache/test_esm2_t33_650M_UR50D_perres.pt   # TEST proteins
 python embed_domains.py  --embedder esm2_t33_650M_UR50D                 # trimmed DNA-binding domain
 
 # 2. verify every encoder/interaction combination wires up
@@ -69,6 +72,10 @@ python train.py --folds 1 --epochs 2                   # quick smoke test (1 fol
 python train.py                                        # full leave-proteins-out CV (full protein)
 python train.py --config config_homeodomain.yaml --out-dir runs_hd     # domain-trimmed A/B
 python evaluate.py                                     # aggregate metrics + kNN / mean baselines
+
+# 4. predict on the test set (submission format)
+python main.py DBP1.txt DBP1 test_seqs.txt             # one DBP -> scores, one per line
+python predict_all.py                                  # all 64 DBPs -> submission/ + submission.zip
 ```
 
 The device is selected automatically by [utils.py](utils.py): **Apple MPS →
@@ -125,12 +132,15 @@ for which combinations are compatible.
 | Data sanity | `python data.py` | parsing, one-hot, reverse-complement involution, fold disjointness, `TargetTransform` invariants |
 | Domain report | `python homeodomain.py` | DBD-extraction coverage and self-validation against the homeodomain anchor |
 | Embed (full) | `python embed_proteins.py …` | cache frozen ESM-2 / k-mer protein embeddings (pooled or per-residue) |
+| Embed (test) | `python embed_proteins.py --dbp test_DBPs.txt --out cache/test_…_perres.pt …` | same, for the 64 **test** proteins (frozen, per-residue) |
 | Embed (DBD) | `python embed_domains.py …` | same, but over the trimmed ~60-residue DNA-binding domain |
 | Wiring test | `python model.py` | forward/backward over **every** registered encoder × interaction combo |
 | Train | `python train.py …` | leave-proteins-out CV loop; saves per-fold checkpoints + predictions |
 | Evaluate | `python evaluate.py …` | aggregate metrics + per-protein-mean and kNN-in-ESM baselines |
 | Ensemble | `python ensemble.py <dirs…>` | average held-out predictions across seeds; report lift |
 | Diagnose | `python analyze_preds.py <npz>` | per-protein Pearson distribution for one fold |
+| Predict (one) | `python main.py <ofile> <DBP> <DNA>` | score one test DBP's probes -> one number/line |
+| Predict (all) | `python predict_all.py` | score all 64 test DBPs -> `submission/DBP*.txt` + `submission.zip` |
 
 ---
 
@@ -167,8 +177,9 @@ epochs: 100
 lr: 0.0015
 weight_decay: 0.0001
 
-# loss = Huber + corr_lambda * (1 - per-protein Pearson)
-loss: { huber_delta: 1.0, corr_lambda: 1.0 }
+# loss = Huber + corr_lambda * (1 - per-protein Pearson); corr_lambda>1 makes the
+# correlation term (the actual Pearson grade) dominate, Huber just anchors scale.
+loss: { huber_delta: 1.0, corr_lambda: 3.0 }
 esm_noise: 0.05        # Gaussian noise on frozen residue reps (protein-side regulariser)
 scheduler: cosine      # cosine (warmup -> cosine decay) | plateau
 warmup_epochs: 5
@@ -341,6 +352,54 @@ a model-wide weakness.
 
 ---
 
+## Prediction & submission
+
+The grader runs the trained model on a held-out **test set** of 64 proteins
+([test_DBPs.txt](test_DBPs.txt), one sequence per line) and ~11.7k DNA probes
+([test_seqs.txt](test_seqs.txt)). The submission is the 64 per-protein score
+files (`DBP1.txt` … `DBP64.txt`, one number per line in probe order) zipped
+together; the grade is the **mean per-protein Pearson** of those scores against
+the true PBM intensities, plus a run-time term.
+
+**Required CLI** (exact signature from the brief):
+
+```bash
+python main.py <ofile> <DBP> <DNA>
+#   <ofile>  output path; one predicted score per line, in <DNA> order
+#   <DBP>    protein name, e.g. DBP1 .. DBP64 (1-based position in test_DBPs.txt)
+#   <DNA>    DNA-probe test file (one probe per line)
+python main.py DBP5.txt DBP5 test_seqs.txt
+```
+
+`main.py` looks up the protein by position in `--dbp-file` (default
+`test_DBPs.txt`), fetches its **frozen** per-residue ESM-2 embedding from
+`cache/test_esm2_t33_650M_UR50D_perres.pt` (built in Quickstart step 1; it falls
+back to computing the embedding on the fly if the cache is missing), one-hot
+encodes the probes, and scores every probe through an **ensemble** of the fold
+checkpoints in `--run-dir` (default `runs_caffeine`). Each member is per-protein
+z-scored before averaging — the grade is Pearson, which is invariant to that
+affine map, so no single member's output scale dominates. Each probe is averaged
+with its reverse complement (`tta_rc`). Prediction time is printed to stderr.
+
+> **Why model-only (no kNN at test time):** the kNN-in-ESM baseline predicts a
+> protein's profile over the *training* probes; the test probes are new
+> sequences, so kNN cannot score them. Only the model — which encodes arbitrary
+> DNA — generalizes to unseen probes.
+
+**Build the whole submission at once** with [predict_all.py](predict_all.py),
+which loads the model and embeddings **once** and scores all 64 proteins against
+all probes in a single batched pass (far faster than 64 separate `main.py` calls,
+and it reports the per-DBP prediction time for the run-time grade):
+
+```bash
+python predict_all.py            # -> submission/DBP1.txt … DBP64.txt + submission.zip
+```
+
+A per-DBP file from `predict_all.py` is identical (up to GPU float
+nondeterminism) to `python main.py <ofile> DBP<i> test_seqs.txt`.
+
+---
+
 ## Files
 
 | File | Role |
@@ -354,6 +413,8 @@ a model-wide weakness.
 | [model.py](model.py) | `BindingModel` + `build_model` factory + all-combos wiring test |
 | [metrics.py](metrics.py) | per-protein Pearson/Spearman (NaN-safe for constant inputs) |
 | [train.py](train.py) | leave-proteins-out CV loop, blocked trainer, early stopping, per-fold predictions |
+| [main.py](main.py) | **submission entry point** — `python main.py <ofile> <DBP> <DNA>`: score one test DBP's probes |
+| [predict_all.py](predict_all.py) | score all 64 test DBPs in one pass → `submission/DBP*.txt` + `submission.zip` |
 | [evaluate.py](evaluate.py) | aggregate metrics + per-protein-mean and kNN-in-ESM baselines + scatter plot |
 | [ensemble.py](ensemble.py) | seed-ensemble held-out predictions; report lift over best single run |
 | [analyze_preds.py](analyze_preds.py) | per-protein Pearson distribution diagnostic for one fold |

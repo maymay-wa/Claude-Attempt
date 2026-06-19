@@ -5,3 +5,5 @@ runs*
 training_data_small*
 training_data_small.txt
 runs*
+submission*
+*.log

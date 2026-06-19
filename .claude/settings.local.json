@@ -51,7 +51,11 @@
       "Bash(tee runs_crossattn_smoke.log)",
       "Bash(./.venv/bin/python -c ' *)",
       "Bash(./.venv/bin/python model.py)",
-      "Bash(./.venv/bin/python data.py)"
+      "Bash(./.venv/bin/python data.py)",
+      "Bash(python -c \"import torch; d=torch.load\\('cache/test_esm2_t33_650M_UR50D.pt', map_location='cpu'\\); print\\(type\\(d\\)\\); print\\({k:\\(v.shape if hasattr\\(v,'shape'\\) else v\\) for k,v in d.items\\(\\)} if isinstance\\(d,dict\\) else d\\)\")",
+      "Bash(awk '{print length\\($0\\)}' test_seqs.txt)",
+      "Bash(awk '{print length\\($0\\)}' training_seqs_small.txt)",
+      "Bash(awk 'NF{print length\\($0\\)}' test_DBPs.txt)"
     ]
   }
 }

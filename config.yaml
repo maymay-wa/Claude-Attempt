@@ -56,9 +56,14 @@ lr: 0.0015
 weight_decay: 0.0001
 
 # --- loss (elementwise Huber + per-protein correlation term, metric-aligned) ---
+# The grade is pure per-protein Pearson (Corr), which is invariant to scale/shift,
+# so the correlation term IS the objective and Huber only anchors the output scale
+# for stable optimisation. corr_lambda is therefore set >1 to make correlation
+# dominate. A/B (1 fold, 6k probes, 30 ep): corr_lambda 1.0 -> 0.6626 Pearson,
+# 3.0 -> 0.6676 (+0.005). Marginal, as expected near the ~0.70 data ceiling.
 loss:
   huber_delta: 1.0
-  corr_lambda: 1.0      # weight on (1 - per-protein Pearson) over each probe block
+  corr_lambda: 3.0      # weight on (1 - per-protein Pearson) over each probe block
 esm_noise: 0.05         # Gaussian noise on frozen residue reps (protein-side reg)
 scheduler: cosine      # cosine (linear warmup -> cosine decay) | plateau
 warmup_epochs: 5
