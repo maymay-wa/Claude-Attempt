@@ -107,7 +107,7 @@ def fmt(name: str, r: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", default="runs")
+    ap.add_argument("--run-dir", default="runs_caffeine")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--knn-k", type=int, default=1)
     args = ap.parse_args()
